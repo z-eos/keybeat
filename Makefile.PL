@@ -14,6 +14,8 @@ WriteMakefile(
 	      MIN_PERL_VERSION => 5.016001,
 	      PREREQ_PM        => {
 				   'Data::Printer'        => '0.38',
+				   'DBI'                  => '1.643',
+				   'DBD::SQLite'          => '1.70',
 				   'File::Basename'       => '2.84',
 				   'Getopt::Long'         => '2.34',
 				   'Parse::Syslog::Mail'  => '0.17',
