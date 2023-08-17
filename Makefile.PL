@@ -17,6 +17,7 @@ WriteMakefile(
 				   'DBI'                  => '1.643',
 				   'DBD::SQLite'          => '1.70',
 				   'File::Basename'       => '2.84',
+				   'File::Tail'           => '1.3',
 				   'Getopt::Long'         => '2.34',
 				   'Parse::Syslog::Mail'  => '0.17',
 				   'Pod::Man'             => '2.25',
