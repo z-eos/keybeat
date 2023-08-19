@@ -27,12 +27,14 @@ our $VERSION = '0.0.1';
 
 sub new {
   my $class = shift;
+  my $tl = localtime;
   my $self =
     bless {
 	   _progname => fileparse($0),
 	   _progargs => [$0, @ARGV],
-	   _option   => { d                 => 0,
+	   _option   => {
 			  colored           => 0,
+			  db  => { name => undef, },
 			  log => {
 				  logfile => '/var/log/maillog',
 				  save_to => '',
@@ -44,42 +46,26 @@ sub new {
 			  export            => 'raw',
 			  tail              => 0,
 			},
+	   _tl       => $tl,
 	  }, $class;
 
   GetOptions(
              'l|logfile=s' => \$self->{_option}{log}{logfile},
              's|save-to=s' => \$self->{_option}{log}{save_to},
-	     'v+'          => \$self->{_option}{v},
+	     'v|verbose+'  => \$self->{_option}{v},
 	     'c'           => \$self->{_option}{count},
+	     'd|db=s'      => \$self->{_option}{db}{name},
 	     'e|export=s'  => \$self->{_option}{export},
 	     'n|dry-run'   => \$self->{_option}{dryrun},
 	     't|tail'      => \$self->{_option}{tail},
 
 	     'h|help'              => sub { pod2usage(-exitval => 0, -verbose => 2); exit 0 },
-	     'd|debug+'            => \$self->{_option}{d},
 	     'V|version'           => sub { print "$self->{_progname}, version $VERSION\n"; exit 0 },
 	    );
-
-  if ( $self->{_option}{export} && 
-       $self->{_option}{export} ne 'sqlite' &&
-       $self->{_option}{export} ne 'raw' ) {
-    $self->debug_msg( {priority => 'err',
-		message   => "error: Wrong export format. Allowed formats are sqlite and raw",
-		verbosity => $self->{_option}{v} });
-    exit 1;
-  }
-
-  print "log file to be used is: $self->{_option}{log}{logfile}\n" if $self->{_option}{v} > 0;
 
   if ( ! -f $self->{_option}{log}{logfile} ) {
     $self->debug_msg({ priority => 'err',
 		message   => "error: log file configured is $self->{_option}{log}{logfile}; %m",
-		verbosity => $self->{_option}{v} });
-    # pod2usage(0);
-    exit 1;
-  } elsif ( ! $self->{_option}{export} ) {
-    $self->debug_msg({ priority => 'warning',
-		message   => "warning: no extension given, set it please",
 		verbosity => $self->{_option}{v} });
     # pod2usage(0);
     exit 1;
@@ -90,6 +76,31 @@ sub new {
     # pod2usage(0);
     exit 1;
   }
+
+  ( $self->{_option}{log}{name}, $self->{_option}{log}{dirs}, $self->{_option}{log}{suffix} ) = fileparse($self->o('log')->{logfile});
+  $self->{_option}{log}{stat} = stat($self->o('log')->{logfile});
+
+  if ( $self->{_option}{export} && 
+       $self->{_option}{export} ne 'sqlite' &&
+       $self->{_option}{export} ne 'raw' ) {
+    $self->debug_msg( {priority => 'err',
+		       message   => "error: Wrong export format.",
+		       verbosity => $self->{_option}{v} });
+    exit 1;
+  } elsif ( $self->{_option}{export} eq 'sqlite' ) {
+    if ( ! defined $self->{_option}{db}{name} ) {
+      $self->{_option}{db}{name} =
+	sprintf('%s%s-%s-v%s%s.sqlite',
+		$self->{_option}{log}{save_to} ne '' ? $self->{_option}{log}{save_to} . '/' : $self->{_option}{log}{dirs},
+		$self->{_option}{log}{name},
+		localtime($self->{_option}{log}{stat}->mtime)->ymd(''),
+		$self->{_tl}->ymd(''),
+		$self->{_tl}->hms(''),
+	       );
+    }
+  }
+  p $self->{_option} if $self->{_option}{v};
+  print "log file to be used is: $self->{_option}{log}{logfile}\n" if $self->{_option}{v};
 
   return $self;
 }
@@ -122,9 +133,6 @@ sub run {
   my $val;
   my @log_row;
 
-  ( $self->l->{name}, $self->l->{dirs}, $self->l->{suffix} ) = fileparse($self->o('log')->{logfile});
-  $self->l->{stat} = stat($self->o('log')->{logfile});
-
   my $file;
   if ( $self->o('tail') ) {
     $file = File::Tail->new($self->o('log')->{logfile});
@@ -138,11 +146,12 @@ sub run {
 
   $self->sql_db_create
     if $self->o('export') eq 'sqlite' &&
-    ! exists $self->l->{db}->{name};
+    ! exists $self->o('db')->{name};
 
   while ( my $r = $maillog->next ) {
+    next if exists $r->{ldap};
     next if $r->{text} =~ /AUTH|STARTTLS|--|NOQUEUE/;
-
+    p $r;
     if ( exists $r->{'to'} ) {
 
       $res->{$r->{id}}->{timestamp}->{to} = $r->{timestamp}         // 'NA';
@@ -154,6 +163,8 @@ sub run {
 	if exists $r->{to};
       $res->{$r->{id}}->{relay}->{to}     = $self->split_relay($r->{relay})
 	if exists $r->{relay};
+
+      p $res->{$r->{id}} if $self->o('tail') && $self->v;
 
       $self->
 	sql_insert({
@@ -183,6 +194,8 @@ sub run {
       $res->{$r->{id}}->{relay}->{fr}     = $self->split_relay($r->{relay})
 	if exists $r->{relay};
 
+      p $res->{$r->{id}} if $self->o('tail') && $self->v;
+      
       $self->
 	sql_insert({
 		    table => 'mail_from',
@@ -203,12 +216,14 @@ sub run {
       if exists $r->{status} &&
       $r->{status} =~ /^.*connection.*$/ &&
       $r->{status} !~ /^.*did not issue.*$/;
+
+    delete $res->{$r->{id}} if $self->o('tail');
   }
 
   p $res if $self->o('export') eq 'raw' && $self->v > 2;
 
-  if ($self->o('export') eq 'sqlite' && ! $self->o('dryrun')) {
-    $self->sql_db_create if ! exists $self->l->{db}->{name};
+  if ($self->o('export') eq 'sqlite' && ! $self->o('tail')) {
+    $self->sql_db_create if ! exists $self->o('db')->{name};
     $self->tosqlite( { log_rows  => $res, } );
   }
 
@@ -219,12 +234,16 @@ sub run {
 #
 ######################################################################
 
+sub parse_line {
+  my ($self, $args) = @_;
+
+}
+
 sub sql_insert {
   my ($self, $args) = @_;
 
-  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->l->{db}->{name},"","",
-			 { AutoCommit => 1,
-			   RaiseError => 1, });
+  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->o('db')->{name},"","",
+			 { AutoCommit => 1, RaiseError => 1, });
 
   $dbh->do("PRAGMA cache_size = 100000") or die $dbh->errstr;
   $dbh->begin_work or die $dbh->errstr;
@@ -243,108 +262,19 @@ sub sql_insert {
   $dbh->disconnect;
 }
 
-sub tosqlite {
-  my ($self, $args) = @_;
-
-  $args->{logfilemtime} = localtime($self->l->{stat}->mtime);
-
-  my $tl = localtime;
-  my $arg =
-    {
-     log_rows  => $args->{log_rows},
-    };
-
-  p $arg if $self->v > 3;
-  
-  print "database file to be used is: ",$self->l->{db}->{name},"\n" if $self->v > 1;
-
-  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->l->{db}->{name},"","",
-			 { AutoCommit => 1,
-			   RaiseError => 1, });
-
-  $dbh->do("PRAGMA cache_size = 100000") or die $dbh->errstr;
-  $dbh->begin_work or die $dbh->errstr;
-
-  my $sth;
-  foreach ( keys ( %{$arg->{log_rows}} ) ) {
-    next if ! $arg->{log_rows}->{$_}->{addr}->{to} ||
-      ! $arg->{log_rows}->{$_}->{addr}->{fr};
-    $sth = $dbh->prepare('INSERT OR IGNORE INTO maillog VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
-    $sth->execute( $_,
-		   $arg->{log_rows}->{$_}->{timestamp}->{to},
-		   $arg->{log_rows}->{$_}->{addr}->{fr},
-		   $arg->{log_rows}->{$_}->{addr}->{to},
-		   $arg->{log_rows}->{$_}->{size},
-		   $arg->{log_rows}->{$_}->{delay},
-		   $arg->{log_rows}->{$_}->{xdelay},
-		   $arg->{log_rows}->{$_}->{relay}->{fr}->{ip},
-		   $arg->{log_rows}->{$_}->{relay}->{fr}->{fqdn},
-		   $arg->{log_rows}->{$_}->{relay}->{to}->{ip},
-		   $arg->{log_rows}->{$_}->{relay}->{to}->{fqdn},
-		   $arg->{log_rows}->{$_}->{dsn},
-		   $arg->{log_rows}->{$_}->{msgid},
-		   $arg->{log_rows}->{$_}->{status},
-		 );
-  }
-
-  $dbh->commit or die $dbh->errstr;
-  $dbh->begin_work or die $dbh->errstr;
-
-  $arg->{addr_to_unique_select} = sprintf("
-INSERT INTO addr_to_unique (addr_to_unique, addr_to_count)
-       SELECT DISTINCT lower(addr_to), count(addr_to)
-              FROM maillog WHERE substr(addr_to,instr(addr_to, '\@') + 1) NOT IN ( '%s' )
-              AND addr_to NOT LIKE '%%,%%' GROUP BY addr_to",
-					  join("','", @{relay_domains()}, @{$self->o('relay_domains_sfx')}));
-
-  p $arg->{addr_to_unique_select} if $self->v > 1;
-  $dbh->do($arg->{addr_to_unique_select}) or die $dbh->errstr;
-  #$sth = $dbh->prepare( $arg->{addr_to_unique_select} );
-  #$sth->execute( "'" . join("','", @{relay_domains()}) . "','root'" );
-  $dbh->commit or die $dbh->errstr;
-
-  $dbh->disconnect;
-
-  $self->debug_msg({ priority  => 'info',
-	      message   => sprintf('info: processing complete %s%s -> %s',
-				  $self->l->{dirs},
-				  $self->l->{name},
-				  $self->l->{db}->{name}),
-	      verbosity => $self->v });
-}
-
 sub sql_db_create {
   my ($self, $args) = @_;
 
-  $args->{logfilemtime} = localtime($self->l->{stat}->mtime);
+  print "database file to be created is: ",$self->o('db')->{name},"\n" if $self->v > 1;
 
-  my $tl = localtime;
-  my $arg =
-    {
-     localtime => $self->{_tl},
-     dbfile    =>
-     sprintf('%s%s-%s-v%s%s.sqlite',
-	     $self->l->{save_to} ne '' ? $self->l->{save_to} . '/' : $self->l->{dirs},
-	     $self->l->{name},
-	     $args->{logfilemtime}->ymd(''),
-	     $tl->ymd(''),
-	     $tl->hms(''),
-	    ),
-    };
-
-  $self->l->{db}->{name} = $arg->{dbfile};
-  p $arg if $self->v > 3;
-  print "database file to be created is: ",$self->l->{db}->{name},"\n" if $self->v > 1;
-
-  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->l->{db}->{name},"","",
+  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->o('db')->{name},"","",
 			   { AutoCommit => 1,
 			     RaiseError => 1, });
-
   $dbh->do("PRAGMA cache_size = 100000") or die $dbh->errstr;
   $dbh->begin_work or die $dbh->errstr;
 
   my $stub1 = $self->l->{logfile};
-  my $stub2 = $self->l->{db}->{name};
+  my $stub2 = $self->o('db')->{name};
   my $tbl_create = qq{CREATE TABLE maillog
   -- $stub1 data processed, generated with mailstate
   -- results are written to $stub2
@@ -377,8 +307,6 @@ sub sql_db_create {
   );};
   p $tbl_create if $self->v > 1;
   $dbh->do($tbl_create) or die $dbh->errstr;
-
-
 
   $tbl_create = qq{CREATE TABLE rcpt_to
   -- $stub1 data processed, generated with mailstate
@@ -414,22 +342,23 @@ sub sql_db_create {
 
   my $idx_create =
     [
-     q{CREATE INDEX m_addr_fr ON maillog ( addr_fr );},
-     q{CREATE INDEX m_addr_to ON maillog ( addr_to );},
-     q{CREATE INDEX m_from_to_addr ON maillog ( addr_fr, addr_to );},
-     q{CREATE INDEX m_relay_fr_ip ON maillog ( relay_fr_ip );},
+     q{CREATE INDEX m_addr_fr       ON maillog ( addr_fr );},
+     q{CREATE INDEX m_addr_to       ON maillog ( addr_to );},
+     q{CREATE INDEX m_from_to_addr  ON maillog ( addr_fr, addr_to );},
+     q{CREATE INDEX m_relay_fr_ip   ON maillog ( relay_fr_ip );},
      q{CREATE INDEX m_relay_fr_fqdn ON maillog ( relay_fr_fqdn );},
-     q{CREATE INDEX m_relay_to_ip ON maillog ( relay_to_ip );},
+     q{CREATE INDEX m_relay_to_ip   ON maillog ( relay_to_ip );},
      q{CREATE INDEX m_relay_to_fqdn ON maillog ( relay_to_fqdn );},
-     q{CREATE INDEX m_msgid ON maillog ( msgid );},
-     q{CREATE INDEX m_stat ON maillog ( stat );},
+     q{CREATE INDEX m_msgid         ON maillog ( msgid );},
+     q{CREATE INDEX m_stat          ON maillog ( stat );},
 
-     q{CREATE INDEX f_addr_fr ON mail_from ( addr_fr );},
-     q{CREATE INDEX t_addr_to ON rcpt_to   ( addr_to );},
+     q{CREATE INDEX f_addr_fr       ON mail_from ( addr_fr );},
+     q{CREATE INDEX t_id_stat       ON rcpt_to   ( id, stat );},
+     q{CREATE INDEX t_addr_to       ON rcpt_to   ( addr_to );},
      q{CREATE INDEX f_relay_fr_ip   ON mail_from ( relay_fr_ip );},
      q{CREATE INDEX f_relay_fr_fqdn ON mail_from ( relay_fr_fqdn );},
-     q{CREATE INDEX t_relay_to_ip   ON rcpt_to ( relay_to_ip );},
-     q{CREATE INDEX t_relay_to_fqdn ON rcpt_to ( relay_to_fqdn );},
+     q{CREATE INDEX t_relay_to_ip   ON rcpt_to   ( relay_to_ip );},
+     q{CREATE INDEX t_relay_to_fqdn ON rcpt_to   ( relay_to_fqdn );},
     ];
 
   foreach (@{$idx_create}) {
@@ -453,7 +382,7 @@ sub sql_db_create {
            f.msgid AS msgid,
            t.stat AS stat
     FROM mail_from AS f LEFT JOIN rcpt_to AS t ON f.id = t.id
-    ORDER BY f.ts, f.id;};
+    ORDER BY f.ts, f.id, t.stat;};
   p $tbl_create if $self->v > 1;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
@@ -518,13 +447,83 @@ sub split_relay {
 
 sub strip_addr {
   my ($self, $addr) = @_;
-  my $return;
-  if ($addr =~ /<(.*@.*)>/) {
-    $return = $1;
-  } else {
-    $return = $addr;
+  # my $return;
+  # if ($addr =~ /<(.*@.*)>/) {
+  #   $return = $1;
+  # } else {
+  #   $return = $addr;
+  # }
+  # return lc($return);
+  $addr =~ tr/<>//d;
+  return $addr;
+}
+
+sub tosqlite {
+  my ($self, $args) = @_;
+
+  $args->{logfilemtime} = localtime($self->l->{stat}->mtime);
+
+  my $tl = localtime;
+  my $arg =
+    {
+     log_rows  => $args->{log_rows},
+    };
+
+  p $arg if $self->v > 3;
+  
+  print "database file to be used is: ",$self->l->{db}->{name},"\n" if $self->v > 1;
+
+  my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->o('db')->{name},"","",
+			 { AutoCommit => 1, RaiseError => 1, });
+
+  $dbh->do("PRAGMA cache_size = 100000") or die $dbh->errstr;
+  $dbh->begin_work or die $dbh->errstr;
+
+  my $sth;
+  foreach ( keys ( %{$arg->{log_rows}} ) ) {
+    next if ! $arg->{log_rows}->{$_}->{addr}->{to} ||
+      ! $arg->{log_rows}->{$_}->{addr}->{fr};
+    $sth = $dbh->prepare('INSERT OR IGNORE INTO maillog VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    $sth->execute( $_,
+		   $arg->{log_rows}->{$_}->{timestamp}->{to},
+		   $arg->{log_rows}->{$_}->{addr}->{fr},
+		   $arg->{log_rows}->{$_}->{addr}->{to},
+		   $arg->{log_rows}->{$_}->{size},
+		   $arg->{log_rows}->{$_}->{delay},
+		   $arg->{log_rows}->{$_}->{xdelay},
+		   $arg->{log_rows}->{$_}->{relay}->{fr}->{ip},
+		   $arg->{log_rows}->{$_}->{relay}->{fr}->{fqdn},
+		   $arg->{log_rows}->{$_}->{relay}->{to}->{ip},
+		   $arg->{log_rows}->{$_}->{relay}->{to}->{fqdn},
+		   $arg->{log_rows}->{$_}->{dsn},
+		   $arg->{log_rows}->{$_}->{msgid},
+		   $arg->{log_rows}->{$_}->{status},
+		 );
   }
-  return lc($return);
+
+  $dbh->commit or die $dbh->errstr;
+  $dbh->begin_work or die $dbh->errstr;
+
+  $arg->{addr_to_unique_select} = sprintf("
+INSERT OR IGNORE INTO addr_to_unique (addr_to_unique, addr_to_count)
+       SELECT DISTINCT lower(addr_to), count(addr_to)
+              FROM maillog WHERE substr(addr_to,instr(addr_to, '\@') + 1) NOT IN ( '%s' )
+              AND addr_to NOT LIKE '%%,%%' GROUP BY addr_to",
+					  join("','", @{relay_domains()}, @{$self->o('relay_domains_sfx')}));
+
+  p $arg->{addr_to_unique_select} if $self->v > 1;
+  $dbh->do($arg->{addr_to_unique_select}) or die $dbh->errstr;
+  #$sth = $dbh->prepare( $arg->{addr_to_unique_select} );
+  #$sth->execute( "'" . join("','", @{relay_domains()}) . "','root'" );
+  $dbh->commit or die $dbh->errstr;
+
+  $dbh->disconnect;
+
+  $self->debug_msg({ priority  => 'info',
+		     message   => sprintf('info: processing %s -> %s complete',
+					  $self->l->{logfile},
+					  $self->o('db')->{name}),
+		     verbosity => $self->v });
 }
 
 1;
