@@ -234,10 +234,49 @@ sub run {
 #
 ######################################################################
 
-sub parse_line {
+sub line {
   my ($self, $args) = @_;
+  my $r  = $args->{r};
+  my $res;
+  if ( exists $r->{'to'} ) {
+    $res->{table}                     = 'rcpt_to';
+    $res->{values} = [
+		      $r->{id};
+		      $r->{timestamp}         // 'NA';
+		      $r->{delay}             // 'NA';
+		      $r->{xdelay}            // 'NA';
+		      $r->{dsn}               // 'NA';
+		      $r->{status}            // 'NA';
+		      $self->strip_addr($r->{to});
+    $res->{values}->{relay}->{to}     = $self->split_relay($r->{relay})
+      if exists $r->{relay};
 
+    p $res if $self->o('tail') && $self->v;
+
+  } elsif ( exists $r->{'from'} ) {
+    $res->{table}                     = 'mail_from';
+    $res->{values}->{id}              = $r->{id};
+    $res->{values}->{timestamp}->{fr} = $r->{timestamp}         // 'NA';
+    $res->{values}->{size}            = $r->{size};
+    $res->{values}->{addr}->{fr}      = $self->strip_addr($r->{from})
+      if exists $r->{from};
+    $res->{values}->{msgid}           = $self->strip_addr($r->{msgid})
+      if exists $r->{msgid};
+    $res->{values}->{relay}->{fr}     = $self->split_relay($r->{relay})
+      if exists $r->{relay};
+
+    p $res->{values} if $self->o('tail') && $self->v;
+
+  }
+
+  $res->{$r->{id}}->{connection} = $r->{status}
+    if exists $r->{status} &&
+    $r->{status} =~ /^.*connection.*$/ &&
+    $r->{status} !~ /^.*did not issue.*$/;
+
+  delete $res->{$r->{id}} if $self->o('tail');
 }
+
 
 sub sql_insert {
   my ($self, $args) = @_;
