@@ -2,15 +2,17 @@
 # -*- mode: cperl; eval: (follow-mode 1); cperl-indent-level: 2; cperl-continued-statement-offset: 2 -*-
 #
 
-package App::mailstate;
+package App::Keybeat;
 
 use strict;
 use warnings;
 use diagnostics;
 
+use Carp;
 use DBI;
-use Data::Printer caller_info => 1, colored => 1, print_escapes => 1, output => 'stdout', class => { expand => 2 },
-  caller_message => "DEBUG __FILENAME__:__LINE__ ";
+# use Data::Printer caller_info => 1, colored => 1, print_escapes => 1, output => 'stdout', class => { expand => 2 },
+#   caller_message => "DEBUG __FILENAME__:__LINE__ ";
+use Data::Printer;
 use File::Basename;
 use File::stat;
 use File::Tail;
@@ -19,8 +21,11 @@ use Net::LDAP;
 use Parse::Syslog::Mail;
 use Pod::Man;
 use Pod::Usage qw(pod2usage);;
+use POSIX;
 use Sys::Syslog qw(:standard :extended :macros);
 use Time::Piece;
+
+use App::Keybeat::Logg;
 
 my  @PROGARG = ($0, @ARGV);
 our $VERSION = '0.0.1';
@@ -32,75 +37,91 @@ sub new {
     bless {
 	   _progname => fileparse($0),
 	   _progargs => [$0, @ARGV],
-	   _option   => {
-			  colored           => 0,
-			  db  => { name => undef, },
-			  log => {
-				  logfile => '/var/log/maillog',
-				  save_to => '',
-				 },
-			  relay_domains_sfx => [ 'root','xx','ibs','ibs.dn.ua' ],
-			  v                 => 0,
-			  dryrun            => 0,
-			  count             => 1,
-			  export            => 'raw',
-			  tail              => 0,
-			},
+	   _daemonargs => [$0, @ARGV],
+	   _opt => {
+		    colored           => 0,
+		    db  => { name => undef, },
+		    log => {
+			    logfile => '/var/log/maillog',
+			    save_to => '',
+			   },
+		    syslog => {
+			       facility => 'LOG_USER',
+			      },
+		    relay_domains_sfx => [ 'root','xx','ibs','ibs.dn.ua' ],
+		    v                 => 0,
+		    daemon            => 0,
+		    dryrun            => 0,
+		    count             => 1,
+		    export            => 'raw',
+		    last_forever      => 1,
+		    tail              => 0,
+		    ts_fmt            => "%a %F %T %Z (%z)",
+		   },
 	   _tl       => $tl,
 	  }, $class;
 
   GetOptions(
-             'l|logfile=s' => \$self->{_option}{log}{logfile},
-             's|save-to=s' => \$self->{_option}{log}{save_to},
-	     'v|verbose+'  => \$self->{_option}{v},
-	     'c'           => \$self->{_option}{count},
-	     'd|db=s'      => \$self->{_option}{db}{name},
-	     'e|export=s'  => \$self->{_option}{export},
-	     'n|dry-run'   => \$self->{_option}{dryrun},
-	     't|tail'      => \$self->{_option}{tail},
+             'l|logfile=s' => \$self->{_opt}{log}{logfile},
+             's|save-to=s' => \$self->{_opt}{log}{save_to},
+	     'v|verbose+'  => \$self->{_opt}{v},
+	     'c'           => \$self->{_opt}{count},
+	     'D|daemon'    => \$self->{_opt}{daemon},
+	     'd|db=s'      => \$self->{_opt}{db}{name},
+	     'e|export=s'  => \$self->{_opt}{export},
+	     'colors'      => \$self->{_opt}{colors},
+	     'fg'          => \$self->{_opt}{fg},
+	     'n|dry-run'   => \$self->{_opt}{dryrun},
+	     't|tail'      => \$self->{_opt}{tail},
 
 	     'h|help'              => sub { pod2usage(-exitval => 0, -verbose => 2); exit 0 },
 	     'V|version'           => sub { print "$self->{_progname}, version $VERSION\n"; exit 0 },
 	    );
 
-  if ( ! -f $self->{_option}{log}{logfile} ) {
-    $self->debug_msg({ priority => 'err',
-		message   => "error: log file configured is $self->{_option}{log}{logfile}; %m",
-		verbosity => $self->{_option}{v} });
-    # pod2usage(0);
+  $self->{_opt}{l} = new
+    App::Keybeat::Logg( prognam    => $self->{_progname},
+			 facility   => $self->{_opt}{syslog}{facility},
+			 foreground => $self->{_opt}{fg},
+			 colors     => $self->{_opt}{colors} );
+
+  if ( ! -f $self->{_opt}{log}{logfile} ) {
+    $self->l->cc( pr => 'err', fm => "%s:%s: log file: %s; %m",
+		  ls => [ __FILE__,__LINE__,$self->{log}->{save_to} ] );
     exit 1;
   } elsif ( defined $self->{log}->{save_to} && ! -d $self->{log}->{save_to} ) {
-    $self->debug_msg( {priority => 'warning',
-		message   => "warning: directory to save db file to is $self->{log}->{save_to}; %m",
-		verbosity => $self->{_option}{v} });
-    # pod2usage(0);
+    $self->l->cc( pr => 'err', fm => "%s:%s: dir to save db file: %s; %m",
+		  ls => [ __FILE__,__LINE__,$self->{log}->{save_to} ] );
     exit 1;
   }
 
-  ( $self->{_option}{log}{name}, $self->{_option}{log}{dirs}, $self->{_option}{log}{suffix} ) = fileparse($self->o('log')->{logfile});
-  $self->{_option}{log}{stat} = stat($self->o('log')->{logfile});
+  ( $self->{_opt}{log}{name}, $self->{_opt}{log}{dirs}, $self->{_opt}{log}{suffix} ) = fileparse($self->o('log')->{logfile});
+  $self->{_opt}{log}{stat} = stat($self->o('log')->{logfile});
 
-  if ( $self->{_option}{export} && 
-       $self->{_option}{export} ne 'sqlite' &&
-       $self->{_option}{export} ne 'raw' ) {
-    $self->debug_msg( {priority => 'err',
-		       message   => "error: Wrong export format.",
-		       verbosity => $self->{_option}{v} });
+  if ( $self->{_opt}{export} && 
+       $self->{_opt}{export} ne 'sqlite' &&
+       $self->{_opt}{export} ne 'raw' ) {
+    $self->l->cc( pr => 'err', fm => "%s:%s: Wrong export format.",
+		  ls => [ __FILE__,__LINE__ ] );
     exit 1;
-  } elsif ( $self->{_option}{export} eq 'sqlite' ) {
-    if ( ! defined $self->{_option}{db}{name} ) {
-      $self->{_option}{db}{name} =
+  } elsif ( $self->{_opt}{export} eq 'sqlite' ) {
+    if ( ! defined $self->{_opt}{db}{name} ) {
+      $self->{_opt}{db}{name} =
 	sprintf('%s%s-%s-v%s%s.sqlite',
-		$self->{_option}{log}{save_to} ne '' ? $self->{_option}{log}{save_to} . '/' : $self->{_option}{log}{dirs},
-		$self->{_option}{log}{name},
-		localtime($self->{_option}{log}{stat}->mtime)->ymd(''),
+		$self->{_opt}{log}{save_to} ne '' ? $self->{_opt}{log}{save_to} . '/' : $self->{_opt}{log}{dirs},
+		$self->{_opt}{log}{name},
+		localtime($self->{_opt}{log}{stat}->mtime)->ymd(''),
 		$self->{_tl}->ymd(''),
 		$self->{_tl}->hms(''),
 	       );
     }
   }
-  p $self->{_option} if $self->{_option}{v};
-  print "log file to be used is: $self->{_option}{log}{logfile}\n" if $self->{_option}{v};
+  $self->l->cc( pr => 'info', fm => "%s:%s: options: %s",
+		ls => [ __FILE__,__LINE__, $self->{_opt} ] )
+    if $self->{_opt}{v} > 2;
+
+  $self->l->cc( pr => 'info', fm => "%s:%s: log file to be used is: %s",
+		ls => [ __FILE__,__LINE__, $self->{_opt}{log}{logfile} ] )
+    if $self->{_opt}{v};
 
   return $self;
 }
@@ -110,29 +131,19 @@ sub progargs { return join(' ', @{shift->{_progargs}}); }
 
 sub o {
   my ($self,$opt) = @_;
-  return $self->{_option}{$opt};
+  croak "unknown/undefined variable"
+    if ! exists $self->{_opt}{$opt};
+  return $self->{_opt}{$opt};
 }
 
-sub l { shift->{_option}{log} }
+sub l { shift->{_opt}{l} }
 
-sub v { shift->{_option}{v} }
+sub v { shift->{_opt}{v} }
 
 sub run {
   my $self = shift;
 
-  my $element;
-  my $i;
-  my $id;
-  my $index;
-  my $key;
-  my $log;
   my $res;
-  my $rest;
-  my $t;
-  my $ts;
-  my $val;
-  my @log_row;
-
   my $file;
   if ( $self->o('tail') ) {
     $file = File::Tail->new($self->o('log')->{logfile});
@@ -144,139 +155,177 @@ sub run {
 	 $self->o('log')->{logfile},
 	 allow_future => 1);
 
+  $self->daemonize if ! $self->o('fg');
+
   $self->sql_db_create
     if $self->o('export') eq 'sqlite' &&
-    ! exists $self->o('db')->{name};
+    ! -e $self->o('db')->{name};
 
-  while ( my $r = $maillog->next ) {
-    next if exists $r->{ldap};
-    next if $r->{text} =~ /AUTH|STARTTLS|--|NOQUEUE/;
-    p $r;
-    if ( exists $r->{'to'} ) {
+  while ( $self->o('last_forever') ) {
+    while ( my $r = $maillog->next ) {
+      next if exists $r->{ldap};
+      next if $r->{text} =~ /AUTH|STARTTLS|--|NOQUEUE/;
 
-      $res->{$r->{id}}->{timestamp}->{to} = $r->{timestamp}         // 'NA';
-      $res->{$r->{id}}->{delay}           = $r->{delay}             // 'NA';
-      $res->{$r->{id}}->{xdelay}          = $r->{xdelay}            // 'NA';
-      $res->{$r->{id}}->{dsn}             = $r->{dsn}               // 'NA';
-      $res->{$r->{id}}->{status}          = $r->{status}            // 'NA';
-      $res->{$r->{id}}->{addr}->{to}      = $self->strip_addr($r->{to})
-	if exists $r->{to};
-      $res->{$r->{id}}->{relay}->{to}     = $self->split_relay($r->{relay})
-	if exists $r->{relay};
+      if ( exists $r->{'to'} ) {
 
-      p $res->{$r->{id}} if $self->o('tail') && $self->v;
+	$res->{$r->{id}}->{timestamp}->{to} = $r->{timestamp}         // 'NA';
+	$res->{$r->{id}}->{delay}           = $r->{delay}             // 'NA';
+	$res->{$r->{id}}->{xdelay}          = $r->{xdelay}            // 'NA';
+	$res->{$r->{id}}->{dsn}             = $r->{dsn}               // 'NA';
+	$res->{$r->{id}}->{status}          = $r->{status}            // 'NA';
+	$res->{$r->{id}}->{addr}->{to}      = $self->strip_addr($r->{to})
+	  if exists $r->{to};
+	$res->{$r->{id}}->{relay}->{to}     = $self->split_relay($r->{relay})
+	  if exists $r->{relay};
 
-      $self->
-	sql_insert({
-		    table => 'rcpt_to',
-		    values =>
-		    [
-		     $r->{id} // undef,
-		     $r->{timestamp} // undef,
-		     $res->{$r->{id}}->{addr}->{to} // undef,
-		     $res->{$r->{id}}->{delay} // undef,
-		     $res->{$r->{id}}->{xdelay} // undef,
-		     $res->{$r->{id}}->{relay}->{to}->{ip} // undef,
-		     $res->{$r->{id}}->{relay}->{to}->{fqdn} // undef,
-		     $res->{$r->{id}}->{dsn} // undef,
-		     $res->{$r->{id}}->{status} // undef,
-		    ]
-		   });
+	$self->l->cc( pr => 'info', fm => "%s:%s: rcpt_to: %s",
+		      ls => [ __FILE__,__LINE__, $res->{$r->{id}} ] )
+	  if $self->v > 3;
+
+	$self->
+	  sql_insert({
+		      table => 'rcpt_to',
+		      values =>
+		      [
+		       $r->{id} // undef,
+		       $r->{timestamp} // undef,
+		       $res->{$r->{id}}->{addr}->{to} // undef,
+		       $res->{$r->{id}}->{delay} // undef,
+		       $res->{$r->{id}}->{xdelay} // undef,
+		       $res->{$r->{id}}->{relay}->{to}->{ip} // undef,
+		       $res->{$r->{id}}->{relay}->{to}->{fqdn} // undef,
+		       $res->{$r->{id}}->{dsn} // undef,
+		       $res->{$r->{id}}->{status} // undef,
+		      ]
+		     });
       
-    } elsif ( exists $r->{'from'} ) {
+      } elsif ( exists $r->{'from'} ) {
 
-      $res->{$r->{id}}->{timestamp}->{fr} = $r->{timestamp}         // 'NA';
-      $res->{$r->{id}}->{size}            = $r->{size};
-      $res->{$r->{id}}->{addr}->{fr}      = $self->strip_addr($r->{from})
-	if exists $r->{from};
-      $res->{$r->{id}}->{msgid}           = $self->strip_addr($r->{msgid})
-	if exists $r->{msgid};
-      $res->{$r->{id}}->{relay}->{fr}     = $self->split_relay($r->{relay})
-	if exists $r->{relay};
+	$res->{$r->{id}}->{timestamp}->{fr} = $r->{timestamp}         // 'NA';
+	$res->{$r->{id}}->{size}            = $r->{size};
+	$res->{$r->{id}}->{addr}->{fr}      = $self->strip_addr($r->{from})
+	  if exists $r->{from};
+	$res->{$r->{id}}->{msgid}           = $self->strip_addr($r->{msgid})
+	  if exists $r->{msgid};
+	$res->{$r->{id}}->{relay}->{fr}     = $self->split_relay($r->{relay})
+	  if exists $r->{relay};
 
-      p $res->{$r->{id}} if $self->o('tail') && $self->v;
-      
-      $self->
-	sql_insert({
-		    table => 'mail_from',
-		    values =>
-		    [
-		     $r->{id} // undef,
-		     $r->{timestamp} // undef,
-		     $res->{$r->{id}}->{addr}->{fr} // undef,
-		     $r->{size} // undef,
-		     $res->{$r->{id}}->{relay}->{fr}->{ip} // undef,
-		     $res->{$r->{id}}->{relay}->{fr}->{fqdn} // undef,
-		     $res->{$r->{id}}->{msgid} // undef,
-		    ]
-		   });
+	$self->l->cc( pr => 'info', fm => "%s:%s: mail_from: %s",
+		      ls => [ __FILE__,__LINE__, $res->{$r->{id}} ] )
+	  if $self->v > 3;
+
+	$self->
+	  sql_insert({
+		      table => 'mail_from',
+		      values =>
+		      [
+		       $r->{id} // undef,
+		       $r->{timestamp} // undef,
+		       $res->{$r->{id}}->{addr}->{fr} // undef,
+		       $r->{size} // undef,
+		       $res->{$r->{id}}->{relay}->{fr}->{ip} // undef,
+		       $res->{$r->{id}}->{relay}->{fr}->{fqdn} // undef,
+		       $res->{$r->{id}}->{msgid} // undef,
+		      ]
+		     });
+      }
+
+      $res->{$r->{id}}->{connection} = $r->{status}
+	if exists $r->{status} &&
+	$r->{status} =~ /^.*connection.*$/ &&
+	$r->{status} !~ /^.*did not issue.*$/;
+
+      delete $res->{$r->{id}} if $self->o('tail');
     }
 
-    $res->{$r->{id}}->{connection} = $r->{status}
-      if exists $r->{status} &&
-      $r->{status} =~ /^.*connection.*$/ &&
-      $r->{status} !~ /^.*did not issue.*$/;
+    $self->l->cc( pr => 'info', fm => "%s:%s: res: %s",
+		  ls => [ __FILE__,__LINE__, $res ] )
+      if $self->o('export') eq 'raw' && $self->v > 2;
 
-    delete $res->{$r->{id}} if $self->o('tail');
+    if ($self->o('export') eq 'sqlite' && ! $self->o('tail')) {
+      $self->sql_db_create if ! exists $self->o('db')->{name};
+      $self->tosqlite( { log_rows  => $res, } );
+    }
+
+    closelog();
+    $self->{_opt}{last_forever} = 0 if ! $self->o('daemon');
   }
-
-  p $res if $self->o('export') eq 'raw' && $self->v > 2;
-
-  if ($self->o('export') eq 'sqlite' && ! $self->o('tail')) {
-    $self->sql_db_create if ! exists $self->o('db')->{name};
-    $self->tosqlite( { log_rows  => $res, } );
-  }
-
-  exit 0;
 }
 
 ######################################################################
 #
 ######################################################################
 
-sub line {
-  my ($self, $args) = @_;
-  my $r  = $args->{r};
-  my $res;
-  if ( exists $r->{'to'} ) {
-    $res->{table}                     = 'rcpt_to';
-    $res->{values} = [
-		      $r->{id};
-		      $r->{timestamp}         // 'NA';
-		      $r->{delay}             // 'NA';
-		      $r->{xdelay}            // 'NA';
-		      $r->{dsn}               // 'NA';
-		      $r->{status}            // 'NA';
-		      $self->strip_addr($r->{to});
-    $res->{values}->{relay}->{to}     = $self->split_relay($r->{relay})
-      if exists $r->{relay};
+sub daemonize {
+  my $self = shift;
+  my $pidfile = '/var/run/keybeat.pid';
+  my ( $pid, $fh, $pp, $orphaned_pid_mtime );
+  if ( -e $pidfile ) {
+    open( $fh, "<", $pidfile) || do {
+      die "Can't open $pidfile for reading: $!";
+      exit 1;
+    };
+    $pid = <$fh>;
+    close($fh) || do { print "closing $pidfile failed: $!\n\n";
+		       exit 1;
+		     };
 
-    p $res if $self->o('tail') && $self->v;
+    if ( kill(0, $pid) ) {
+      print "Doing nothing\npidfile $pidfile of proces with pid $pid, exists and the process is alive\n\n";
+      exit 1;
+    }
 
-  } elsif ( exists $r->{'from'} ) {
-    $res->{table}                     = 'mail_from';
-    $res->{values}->{id}              = $r->{id};
-    $res->{values}->{timestamp}->{fr} = $r->{timestamp}         // 'NA';
-    $res->{values}->{size}            = $r->{size};
-    $res->{values}->{addr}->{fr}      = $self->strip_addr($r->{from})
-      if exists $r->{from};
-    $res->{values}->{msgid}           = $self->strip_addr($r->{msgid})
-      if exists $r->{msgid};
-    $res->{values}->{relay}->{fr}     = $self->split_relay($r->{relay})
-      if exists $r->{relay};
+    $orphaned_pid_mtime = strftime( $self->o('ts_fmt'), localtime( (stat( $pidfile ))[9] ));
+    if ( unlink $pidfile ) {
+      $self->l->cc( pr => 'debug', fm => "%s:%s: orphaned %s was removed",
+		    ls => [ __FILE__,__LINE__, $pidfile ] )
+	if $self->o('v') > 0;
+    } else {
+      $self->l->cc( pr => 'err', fm => "%s:%s: orphaned %s (mtime: %s) was not removed: %s",
+		    ls => [ __FILE__,__LINE__, $pidfile, $orphaned_pid_mtime, $! ] );
+      exit 2;
+    }
 
-    p $res->{values} if $self->o('tail') && $self->v;
-
+    undef $pid;
   }
 
-  $res->{$r->{id}}->{connection} = $r->{status}
-    if exists $r->{status} &&
-    $r->{status} =~ /^.*connection.*$/ &&
-    $r->{status} !~ /^.*did not issue.*$/;
+  $pid = fork();
+  die "fork went wrong: $!\n\n" unless defined $pid;
+  exit(0) if $pid != 0;
 
-  delete $res->{$r->{id}} if $self->o('tail');
+  setsid || do { print "setsid went wrong: $!\n\n"; exit 1; };
+
+  open( $pp, ">", $pidfile) || do {
+    print "Can't open $pidfile for writing: $!"; exit 1; };
+  print $pp "$$";
+  close( $pp ) || do {
+    print "close $pidfile (opened for writing), failed: $!\n\n"; exit 1; };
+
+  if ( $self->o('v') > 1 ) {
+    open (STDIN,  "</dev/null") || do { print "Can't redirect /dev/null to STDIN\n\n";  exit 1; };
+    open (STDOUT, ">/dev/null") || do { print "Can't redirect STDOUT to /dev/null\n\n"; exit 1; };
+    open (STDERR, ">&STDOUT")   || do { print "Can't redirect STDERR to STDOUT\n\n";    exit 1; };
+  }
+
+  $SIG{HUP}  =
+    sub { my $sig = @_;
+	  $self->l->cc( pr => 'warning', fm => "%s:%s: SIG %s received, restarting", ls => [ __FILE__,__LINE__, $sig ] );
+	  exec('perl', @{$self->o('_daemonargs')}); };
+  $SIG{INT} = $SIG{QUIT} = $SIG{ABRT} = $SIG{TERM} =
+    sub { my $sig = @_;
+	  $self->l->cc( pr => 'warning',ls => [ __FILE__,__LINE__, $sig ],
+			fm => "%s:%s:  SIG %s received, exiting" );
+	  $self->{_opt}{last_forever} = 0;
+	};
+  $SIG{PIPE} = 'ignore';
+  $SIG{USR1} =
+    sub { my $sig = @_;
+	  $self->l->cc( pr => 'warning',ls => [ __FILE__,__LINE__, $sig ],
+			fm => "%s:%s: SIG %s received, doing nothing" ) };
+
+  $self->l->cc( pr => 'info', fm => "%s:%s: %s v.%s is started.",
+		ls => [ __FILE__,__LINE__, $self->progname, $VERSION ] );
 }
-
 
 sub sql_insert {
   my ($self, $args) = @_;
@@ -304,7 +353,10 @@ sub sql_insert {
 sub sql_db_create {
   my ($self, $args) = @_;
 
-  print "database file to be created is: ",$self->o('db')->{name},"\n" if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: db file to be created is: %s",
+		ls => [ __FILE__,__LINE__, $self->o('db')->{name} ] )
+    if $self->v > 1;
+  # print "database file to be created is: ",$self->o('db')->{name},"\n" if $self->v > 1;
 
   my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->o('db')->{name},"","",
 			   { AutoCommit => 1,
@@ -312,7 +364,7 @@ sub sql_db_create {
   $dbh->do("PRAGMA cache_size = 100000") or die $dbh->errstr;
   $dbh->begin_work or die $dbh->errstr;
 
-  my $stub1 = $self->l->{logfile};
+  my $stub1 = $self->o('log')->{logfile};
   my $stub2 = $self->o('db')->{name};
   my $tbl_create = qq{CREATE TABLE maillog
   -- $stub1 data processed, generated with mailstate
@@ -333,7 +385,9 @@ sub sql_db_create {
     msgid           TEXT,             -- Message-ID header
     stat            TEXT              -- Status
   );};
-  p $tbl_create if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: tbl_create: %s",
+		ls => [ __FILE__,__LINE__, $tbl_create ] )
+    if $self->v > 2;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
   $tbl_create = qq{CREATE TABLE IF NOT EXISTS addr_to_unique
@@ -344,7 +398,9 @@ sub sql_db_create {
     addr_to_unique TEXT PRIMARY KEY, -- RCPT TO (not ours recipients)
     addr_to_count  NUM               -- emails sent to addr_to number
   );};
-  p $tbl_create if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: tbl_create: %s",
+		ls => [ __FILE__,__LINE__, $tbl_create ] )
+    if $self->v > 2;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
   $tbl_create = qq{CREATE TABLE rcpt_to
@@ -352,16 +408,18 @@ sub sql_db_create {
   -- results are written to $stub2
   (
     id              TEXT, -- sendmail message ID (macros \$i)
-    ts              TEXT,             -- timestamp
-    addr_to         TEXT,             -- RCPT To
-    delay           TEXT,             -- delay
-    xdelay          TEXT,             -- delay
-    relay_to_ip     TEXT,             -- ip address of the recipient relay
-    relay_to_fqdn   TEXT,             -- fqdn of the recipient relay
-    dsn             TEXT,             -- DSN code
-    stat            TEXT              -- Status
+    ts              TEXT, -- timestamp
+    addr_to         TEXT, -- RCPT To
+    delay           TEXT, -- delay
+    xdelay          TEXT, -- delay
+    relay_to_ip     TEXT, -- ip address of the recipient relay
+    relay_to_fqdn   TEXT, -- fqdn of the recipient relay
+    dsn             TEXT, -- DSN code
+    stat            TEXT  -- Status
   );};
-  p $tbl_create if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: tbl_create: %s",
+		ls => [ __FILE__,__LINE__, $tbl_create ] )
+    if $self->v > 2;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
   $tbl_create = qq{CREATE TABLE mail_from
@@ -369,14 +427,16 @@ sub sql_db_create {
   -- results are written to $stub2
   (
     id              TEXT, -- sendmail message ID (macros \$i)
-    ts              TEXT,             -- timestamp
-    addr_fr         TEXT,             -- MAIL From 
-    size            NUM,              -- message size
-    relay_fr_ip     TEXT,             -- ip address of the sender relay
-    relay_fr_fqdn   TEXT,             -- fqdn of the sender relay
-    msgid           TEXT             -- Message-ID header
+    ts              TEXT, -- timestamp
+    addr_fr         TEXT, -- MAIL From 
+    size            NUM,  -- message size
+    relay_fr_ip     TEXT, -- ip address of the sender relay
+    relay_fr_fqdn   TEXT, -- fqdn of the sender relay
+    msgid           TEXT  -- Message-ID header
   );};
-  p $tbl_create if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: tbl_create: %s",
+		ls => [ __FILE__,__LINE__, $tbl_create ] )
+    if $self->v > 2;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
   my $idx_create =
@@ -401,7 +461,9 @@ sub sql_db_create {
     ];
 
   foreach (@{$idx_create}) {
-    p $_ if $self->v > 1;
+    $self->l->cc( pr => 'info', fm => "%s:%s: idx_create: %s",
+		  ls => [ __FILE__,__LINE__, $_ ] )
+      if $self->v > 2;
     $dbh->do($_) or die $dbh->errstr;
   }
 
@@ -422,7 +484,9 @@ sub sql_db_create {
            t.stat AS stat
     FROM mail_from AS f LEFT JOIN rcpt_to AS t ON f.id = t.id
     ORDER BY f.ts, f.id, t.stat;};
-  p $tbl_create if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: tbl_create: %s",
+		ls => [ __FILE__,__LINE__, $tbl_create ] )
+    if $self->{_opt}{v} > 2;
   $dbh->do($tbl_create) or die $dbh->errstr;
 
   $dbh->commit or die $dbh->errstr;
@@ -453,18 +517,6 @@ sub relay_domains {
   return [];
 }
 
-sub debug_msg {
-  my ($self, $args) = @_;
-  my $arg = { priority  => $args->{priority},
-	      message   => $args->{message},
-	      verbosity => $args->{verbosity} || 0, };
-
-  openlog($self->{_progname}, "pid", LOG_MAIL);
-  syslog($arg->{priority}, $arg->{message});
-  closelog();
-  print "DEBUG: $arg->{message}\n" if $arg->{verbosity} > 0
-}
-
 sub split_relay {
   my ($self, $relay) = @_;
   my $return;
@@ -486,13 +538,6 @@ sub split_relay {
 
 sub strip_addr {
   my ($self, $addr) = @_;
-  # my $return;
-  # if ($addr =~ /<(.*@.*)>/) {
-  #   $return = $1;
-  # } else {
-  #   $return = $addr;
-  # }
-  # return lc($return);
   $addr =~ tr/<>//d;
   return $addr;
 }
@@ -500,7 +545,7 @@ sub strip_addr {
 sub tosqlite {
   my ($self, $args) = @_;
 
-  $args->{logfilemtime} = localtime($self->l->{stat}->mtime);
+  $args->{logfilemtime} = localtime($self->o('log')->{stat}->mtime);
 
   my $tl = localtime;
   my $arg =
@@ -509,8 +554,10 @@ sub tosqlite {
     };
 
   p $arg if $self->v > 3;
-  
-  print "database file to be used is: ",$self->l->{db}->{name},"\n" if $self->v > 1;
+
+    $self->l->cc( pr => 'info', fm => "%s:%s: db file to be used is: %s",
+		ls => [ __FILE__,__LINE__, $self->o('db')->{name} ] )
+    if $self->{_opt}{v} > 1;
 
   my $dbh = DBI->connect("dbi:SQLite:dbname=" . $self->o('db')->{name},"","",
 			 { AutoCommit => 1, RaiseError => 1, });
@@ -550,7 +597,9 @@ INSERT OR IGNORE INTO addr_to_unique (addr_to_unique, addr_to_count)
               AND addr_to NOT LIKE '%%,%%' GROUP BY addr_to",
 					  join("','", @{relay_domains()}, @{$self->o('relay_domains_sfx')}));
 
-  p $arg->{addr_to_unique_select} if $self->v > 1;
+  $self->l->cc( pr => 'info', fm => "%s:%s: addr_to_unique_select: %s",
+		ls => [ __FILE__,__LINE__, $arg->{addr_to_unique_select} ] )
+    if $self->v > 2;
   $dbh->do($arg->{addr_to_unique_select}) or die $dbh->errstr;
   #$sth = $dbh->prepare( $arg->{addr_to_unique_select} );
   #$sth->execute( "'" . join("','", @{relay_domains()}) . "','root'" );
@@ -558,11 +607,9 @@ INSERT OR IGNORE INTO addr_to_unique (addr_to_unique, addr_to_count)
 
   $dbh->disconnect;
 
-  $self->debug_msg({ priority  => 'info',
-		     message   => sprintf('info: processing %s -> %s complete',
-					  $self->l->{logfile},
-					  $self->o('db')->{name}),
-		     verbosity => $self->v });
+  $self->l->cc( pr => 'info', fm => "%s:%s: processing %s -> %s complete",
+		ls => [ __FILE__,__LINE__,$self->o('log')->{logfile},
+			$self->o('db')->{name}, ] );
 }
 
 1;

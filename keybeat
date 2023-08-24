@@ -7,9 +7,9 @@ eval 'exec perl -x -wS $0 ${1+"$@"}' if 0;
 
 use strict;
 use warnings;
-use App::mailstate;
+use App::Keybeat;
 
-App::mailstate->new->run;
+App::Keybeat->new->run;
 
 __END__
 
